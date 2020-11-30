@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+#
+# Script to view the output of GCC's -fdump-analyzer-json
+#
+# Copyright (C) 2020 David Malcolm <dmalcolm@redhat.com>
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 3, or (at your option) any
+# later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+import argparse
+import gzip
+import json
+import sys
+
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk
+
+import xdot.ui
+
+class AnalyzerDump:
+    @staticmethod
+    def from_js(js):
+        return AnalyzerDump(js)
+
+    def __init__(self, js):
+        self.js = js
+        self.egraph = ExplodedGraph.from_js(js['egraph'])
+        self.sgraph = Supergraph.from_js(js['sgraph'])
+
+    """
+    def get_enode(self, idx):
+        egraph_js = self.js['egraph']
+        nodes = egraph_js['nodes']
+        return Exploded_node.from_js(nodes[idx])
+    """
+
+def escape_for_dot_label(s, for_record):
+    result = ''
+    for ch in s:
+        if ch == '\n':
+            result += '\\l'
+            escape = True
+        elif ch in '|{}<> ':
+            escape = for_record
+        elif ch == '\\' or ch == '"':
+            escape = True
+        else:
+            escape = False
+        if escape:
+            result += '\\'
+        result += ch
+    return result
+
+def escape_for_dot_html(s):
+    result = ''
+    for ch in s:
+        if ch == '"':
+            result += '&quot;'
+        elif ch == '&':
+            result += '&amp;'
+        elif ch == '<':
+            result += '&lt;'
+        elif ch == '>':
+            result += '&gt;'
+        else:
+            result += ch
+    return result
+
+class EgraphContext:
+    def __init__(self, egraph):
+        self.egraph = egraph
+        self.root_cluster = None
+
+    def get_dot_fillcolor(self, enode):
+        """
+        We want to be able to easily distinguish the no-sm-state case,
+        and to be able to distinguish cases where there's a single state
+        from each other.
+
+        Sum the sm_states, and use the result to choose from a table,
+        modulo table-size, special-casing the "no sm-state" case.
+        """
+        state = enode.state
+        total_sm_state = 0
+        for name, smap in state.js['checkers'].items():
+            for desc, sm_state in smap.items():
+                total_sm_state += hash(sm_state)
+        if total_sm_state > 0:
+            # An arbitrarily-picked collection of light colors.
+            colors = ['azure', 'coral', 'cornsilk', 'lightblue', 'yellow',
+                      'honeydew', 'lightpink', 'lightsalmon', 'palegreen1',
+                      'wheat', 'seashell']
+            return colors[total_sm_state % len(colors)]
+        else:
+            return 'lightgrey'
+
+    def node_to_dot(self, enode):
+        result = ('EN%i [shape=none,margin=0,style=filled,fillcolor=%s,label=\"\n'
+                  % (enode.idx, self.get_dot_fillcolor(enode)))
+
+        label = "EN: %i" % enode.js['idx']
+        if enode.js['status'] == 'MERGER':
+            label += ' (merger)'
+        elif enode.js['status'] == 'BULK MERGED':
+            label += ' (bulk merged)'
+        label += '\n'
+        if True:        # if (args.show_enode_details_p (*this))
+            label += enode.point.multiline_str(self.sgraph)
+            label += '\n'
+            label += enode.state.multiline_str()
+            label += '\n'
+
+        num_processed_stmts = enode.js['processed_stmts']
+        # Show any stmts that were processed within this enode,
+        # and their index within the supernode.
+        if num_processed_stmts > 0:
+            snode = enode.point.get_snode(self.sgraph)
+            point_stmt_idx = enode.point.js['stmt_idx']
+            label += 'stmts: %i\n' % num_processed_stmts
+            for i in range(num_processed_stmts):
+                idx_within_snode = point_stmt_idx + i
+                label += ("  %i: %s\n"
+                          % (idx_within_snode, snode.get_stmt(idx_within_snode)))
+
+        # Dump any saved_diagnostics at this enode
+        for d in self.dm.js['diagnostics']:
+            if d['enode'] == enode.idx:
+                label += ('DIAGNOSTIC: %s (length: %i)\n'
+                          % (d['pending_diagnostic'], d['path_length']))
+        result += escape_for_dot_label(label, for_record=True)
+        result += '"];\n'
+        return result
+
+    def edge_to_dot(self, eedge):
+        style = 'solid,bold'
+        color = 'black'
+        weight = 10
+        constraint = "true"
+        label = ''
+        if 'sedge' in eedge.js:
+            sedge = eedge.js['sedge']
+            label += sedge['desc']
+            kind = sedge['kind']
+            if kind =='SUPEREDGE_CFG_EDGE':
+                pass
+            elif kind =='SUPEREDGE_CALL':
+                color = 'red'
+                #constraint = "false"
+            elif kind == 'SUPEREDGE_RETURN':
+                color = 'green'
+                #constraint = "false"
+            elif kind == 'SUPEREDGE_INTRAPROCEDURAL_CALL':
+                style = 'dotted'
+            else:
+                raise ValueError(kind)
+        if 'custom' in eedge.js:
+            color = 'red'
+            style = 'dotted'
+            label += eedge.js['custom']
+        result = 'EN%i -> EN%i' % (eedge.js['src_idx'], eedge.js['dst_idx'])
+        result += (' [style="%s", color="%s", weight="%d", constraint="%s", headlabel="'
+                   % (style, color, weight, constraint))
+        result += escape_for_dot_label(label, for_record=False)
+        result += '"];\n';
+        return result
+
+class Digraph:
+    def to_dot(self, context):
+        result = 'digraph "digraph" {\n'
+        if context.root_cluster:
+            for node in self.nodes:
+                context.root_cluster.add_node(node)
+            result += context.root_cluster.to_dot(context)
+        else:
+            for node in self.nodes:
+                result += context.node_to_dot(node)
+        for edge in self.edges:
+            result += context.edge_to_dot(edge)
+        result += '}\n'
+        return result
+
+class Supergraph(Digraph):
+    @staticmethod
+    def from_js(js):
+        return Supergraph(js)
+
+    def __init__(self, js):
+        self.js = js
+        self.nodes = [Supernode.from_js(jsnode) for jsnode in js['nodes']]
+        self.edges = [Superedge.from_js(jsedge, self)
+                      for jsedge in js['edges']]
+
+class Supernode:
+    @staticmethod
+    def from_js(js):
+        return Supernode(js)
+
+    def __init__(self, js):
+        self.js = js
+        self.idx = js['idx']
+        self.bb_idx = js['bb_idx']
+
+    def __repr__(self):
+        return 'Supernode(%r)' % self.js
+
+    def get_stmt(self, idx):
+        return self.js['stmts'][idx]
+
+class Superedge:
+    @staticmethod
+    def from_js(js, sgraph):
+        return Superedge(js, sgraph)
+
+    def __init__(self, js, sgraph):
+        self.js = js
+        self.sgraph = sgraph
+
+    @property
+    def src(self):
+        return self.sgraph.nodes[self.js['src_idx']]
+
+    @property
+    def dst(self):
+        return self.sgraph.nodes[self.js['dst_idx']]
+
+class ExplodedGraph(Digraph):
+    @staticmethod
+    def from_js(js):
+        return ExplodedGraph(js)
+
+    def __init__(self, js):
+        self.js = js
+        self.nodes = [ExplodedNode.from_js(jsnode) for jsnode in js['nodes']]
+        self.edges = [ExplodedEdge.from_js(jsedge) for jsedge in js['edges']]
+        self.dm = DiagnosticManager.from_js(js['diagnostic_manager'])
+
+    def get_scc_id(self, snode_idx):
+        return self.js['worklist']['scc'][snode_idx]
+
+class ExplodedNode:
+    @staticmethod
+    def from_js(js):
+        return ExplodedNode(js)
+
+    def __init__(self, js):
+        self.js = js
+        self.idx = js['idx']
+        self.point = ProgramPoint.from_js(js['point'])
+        self.state = ProgramState.from_js(js['state'])
+
+    def get_function(self, sgraph):
+        return self.point.get_function(sgraph)
+
+    def get_snode(self, sgraph):
+        return self.point.get_snode(sgraph)
+
+class ExplodedEdge:
+    @staticmethod
+    def from_js(js):
+        return ExplodedEdge(js)
+
+    def __init__(self, js):
+        self.js = js
+
+class CallString:
+    @staticmethod
+    def from_js(js):
+        return CallString(js)
+
+    def __init__(self, js):
+        self.js = js
+
+    def __str__(self):
+        return str(self.js)
+
+class ProgramPoint:
+    @staticmethod
+    def from_js(js):
+        return ProgramPoint(js)
+
+    def __init__(self, js):
+        self.js = js
+        self.kind = self.js['kind']
+        self.callstring = CallString(self.js['call_string'])
+
+    def __str__(self):
+        return str(self.js)
+
+    def multiline_str(self, sgraph):
+        # TODO: callstring
+        result = ''
+        if self.kind == 'PK_ORIGIN':
+            result += 'origin'
+        elif self.kind == 'PK_BEFORE_SUPERNODE':
+            if 'from_edge_snode_idx' in self.js:
+                result += ('before SN: %i (from SN: %i)'
+                           % (self.js['snode_idx'],
+                              self.js['from_edge_snode_idx']))
+            else:
+                result += ('before SN: %i (NULL from-edge)'
+                           % (self.js['snode_idx']))
+            # TODO: print phi nodes
+        elif self.kind == 'PK_BEFORE_STMT':
+            result += ('before (SN: %i stmt: %i): '
+                       % (self.js['snode_idx'],
+                          self.js['stmt_idx']))
+            result += '\n'
+            result += '%s\n' % self.get_snode(sgraph).get_stmt(self.js['stmt_idx'])
+            # TODO: print source line
+        elif self.kind == 'PK_AFTER_SUPERNODE':
+            result += 'after SN: %i' % self.js['snode_idx']
+        else:
+            raise ValueError(self.kind)
+        return result
+
+    def get_snode(self, sgraph):
+        if 'snode_idx' not in self.js:
+            return None
+        return sgraph.nodes[self.js['snode_idx']]
+
+    def get_function(self, sgraph):
+        snode = self.get_snode(sgraph)
+        if snode is None:
+            return None
+        return snode.js['fun']
+
+def indent(s):
+    return '\n'.join([' ' + line for line in s.splitlines()]) + '\n'
+
+class ProgramState:
+    @staticmethod
+    def from_js(js):
+        return ProgramState(js)
+
+    def __init__(self, js):
+        self.js = js
+        self.store = Store.from_js(js['store'])
+        self.cm = ConstraintManager.from_js(js['constraints'])
+
+    def __str__(self):
+        return str(self.js)
+
+    def multiline_str(self):
+        result = 'rmodel:\n'
+        # region_model::dump_to_pp emits stack depth and which frames
+        result += indent(self.store.multiline_str())
+        result += indent(self.cm.multiline_str())
+        for name, smap in self.js['checkers'].items():
+            result += '%s: ' % name
+            result += str(smap) # TODO
+            #smap->print (m_region_model, true, false, pp);
+            result += '\n'
+        if not self.js['valid']:
+            result += 'invalid state\n'
+        return result
+
+class Store:
+    @staticmethod
+    def from_js(js):
+        return Store(js)
+
+    def __init__(self, js):
+        self.js = js
+
+    def multiline_str(self):
+        result = ''
+        for k,v in self.js.items():
+            if k == 'called_unknown_fn':
+                continue
+            parent_region = k
+            result += 'clusters within %s:\n' % parent_region
+            for base_reg, cluster in v.items():
+                parent_reg_str = 'cluster for: %s\n' % base_reg
+                for binding_key, foo in cluster.items():
+                    parent_reg_str += indent('%s: %s\n' % (binding_key, foo))
+                result += indent(parent_reg_str)
+        result += 'called_unknown_fn: %s\n' % self.js['called_unknown_fn']
+        return result
+
+class ConstraintManager:
+    @staticmethod
+    def from_js(js):
+        return ConstraintManager(js)
+
+    def __init__(self, js):
+        self.js = js
+        self.ecs = [EquivClass.from_js(ecjs) for ecjs in js['ecs']]
+
+    def multiline_str(self):
+        result = 'equiv classes:\n'
+        for i, ec in enumerate(self.ecs):
+            result += '  ec%i: %s\n' % (i, ec)
+            pass
+        result += 'constraints:\n'
+        for i, c in enumerate(self.js['constraints']):
+            result += (' %i: ec%i: %s %s ec%i: %s\n'
+                       % (i,
+                          c['lhs'], self.ecs[c['lhs']],
+                          c['op'],
+                          c['rhs'], self.ecs[c['rhs']]))
+        return result
+
+class EquivClass:
+    @staticmethod
+    def from_js(js):
+        return EquivClass(js)
+
+    def __init__(self, js):
+        self.js = js
+
+    def __str__(self):
+        vals = self.js['svals'][:]
+        if 'constant' in self.js:
+            vals.append(self.js['constant'])
+        return '{%s}' % (' == '.join(vals))
+
+class DiagnosticManager:
+    @staticmethod
+    def from_js(js):
+        return DiagnosticManager(js)
+
+    def __init__(self, js):
+        self.js = js
+
+# TODO:
+"""
+class JsonDecoder(json.JSONDecoder):
+    pass
+
+class DigraphView:
+    pass
+"""
+
+class MyDotWidget(xdot.ui.DotWidget):
+    def on_click(self, element, event):
+        print('GOT HERE: element: %r, event: %r', (element, event))
+        if isinstance(element, xdot.ui.elements.Node):
+            print('CLICK ON NODE')
+        elif isinstance(element, xdot.ui.elements.Edge):
+            print('CLICK ON EDGE')
+
+class EgraphSupernodeCluster:
+    def __init__(self, snode):
+        self.snode = snode
+        self.enodes = []
+
+    def to_dot(self, context):
+        result = 'subgraph "cluster_supernode_%i" {' % self.snode.idx
+        result += 'style="dashed";'
+        result += ('label="SN: %i (bb: %i; scc: %i)";'
+                   % (self.snode.idx, self.snode.bb_idx,
+                      context.egraph.get_scc_id(self.snode.idx)))
+        for enode in self.enodes:
+            result += context.node_to_dot(enode)
+        result += '}\n'
+        return result
+
+    def add_node(self, enode):
+        self.enodes.append(enode)
+
+class EgraphFunCsCluster:
+    def __init__(self, sgraph, fun, cs):
+        self.sgraph = sgraph
+        self.fun = fun
+        self.cs = cs
+        self.subcluster_map = {}
+
+    def to_dot(self, context):
+        result = 'subgraph "cluster_function_%s" {' % self.fun
+        result += 'label="call string: %s' % self.cs
+        result += ' function: %s ";\n' % self.fun
+        for subcluster in self.subcluster_map.values():
+            result += subcluster.to_dot(context)
+        result += '}\n'
+        return result
+
+    def add_node(self, enode):
+        snode = enode.get_snode(self.sgraph)
+        if snode not in self.subcluster_map:
+            self.subcluster_map[snode] = EgraphSupernodeCluster(snode)
+        self.subcluster_map[snode].add_node(enode)
+
+class EgraphRootCluster:
+    def __init__(self, sgraph):
+        self.functionless_enodes = []
+        self.subcluster_map = {}
+        self.sgraph = sgraph
+
+    def add_node(self, enode):
+        fun = enode.get_function(self.sgraph)
+        if fun is None:
+            self.functionless_enodes.append(enode)
+        else:
+            key = (fun, enode.point.callstring)
+            if key not in self.subcluster_map:
+                self.subcluster_map[key] = EgraphFunCsCluster(self.sgraph,
+                                                              fun,
+                                                              enode.point.js['call_string'])
+            self.subcluster_map[key].add_node(enode)
+
+    def to_dot(self, context):
+        result = ''
+        for enode in self.functionless_enodes:
+            result += context.node_to_dot(enode)
+        for subcluster in self.subcluster_map.values():
+            result += subcluster.to_dot(context)
+        return result
+
+class SgraphContext:
+    def __init__(self):
+        pass
+
+    def node_to_dot(self, snode):
+        result = 'subgraph cluster_node_%i {' % snode.idx
+        result += 'style="solid";'
+        result += 'color="black";'
+        result += 'fillcolor="lightgrey";'
+        result += 'label="sn: %i (bb: %i)";' % (snode.idx, snode.bb_idx)
+        result += 'node_%i' % snode.idx
+        result += (' [shape=none,margin=0,style=filled,fillcolor=%s,label=<'
+                   % 'lightgrey')
+        result += '<TABLE BORDER="0">'
+
+        rows = ''
+        if 'returning_call' in snode.js:
+            rows += ('<TR><TD>returning call: %s</TD></TR>\n'
+                       % escape_for_dot_html(snode.js['returning_call']))
+        if snode.bb_idx == 0:
+            rows += '<TR><TD>ENTRY</TD></TR>\n'
+        if snode.bb_idx == 1:
+            rows += '<TR><TD>EXIT</TD></TR>\n'
+        for phi in snode.js['phis']:
+            rows += '<TR><TD>%s</TD></TR>\n' % escape_for_dot_html(phi)
+        for stmt in snode.js['stmts']:
+            rows += '<TR><TD>%s</TD></TR>\n' % escape_for_dot_html(stmt)
+        if rows:
+            result += rows
+        else:
+            result += '<TR><TD>(empty)</TD></TR>\n'
+
+        result += '</TABLE>>];\n\n'
+        # Terminate "subgraph".
+        result += '}\n'
+        return result
+
+    def edge_to_dot(self, sedge):
+        result = ''
+        style = 'solid,bold'
+        color = 'black'
+        weight = 10
+        constraint = 'true'
+        kind = sedge.js['kind']
+        if kind =='SUPEREDGE_CFG_EDGE':
+            pass
+        elif kind =='SUPEREDGE_CALL':
+            color = 'red'
+            #constraint = false
+        elif kind == 'SUPEREDGE_RETURN':
+            color = 'green'
+            #constraint = false
+        elif kind == 'SUPEREDGE_INTRAPROCEDURAL_CALL':
+            style = 'dotted'
+        else:
+            raise ValueError(kind)
+        if 'FAKE' in sedge.js['desc']:
+            style = 'dotted'
+            color = 'green'
+            weight = 0
+        elif 'DFS_BACK' in sedge.js['desc']:
+            style = 'dotted,bold'
+            color = 'blue'
+            weight = 10
+        elif 'FALLTHRU' in sedge.js['desc']:
+            color = 'blue'
+            weight = 100
+        if 'ABNORMAL' in sedge.js['desc']:
+            color = 'red'
+        result += 'node_%i' % sedge.src.idx
+        result += ' -> '
+        result += 'node_%i' % sedge.dst.idx
+        result += (' [style="%s", color="%s", weight=%d, constraint="%s",'
+                   ' ltail=\"cluster_node_%i\", lhead=\"cluster_node_%i\"'
+                   ' headlabel=\"'
+                   % (style, color, weight, constraint,
+                      sedge.src.idx, sedge.dst.idx))
+        result += sedge.js['desc'] # TODO: escape
+        result += '"];\n'
+        return result
+
+"""
+class SgraphBBCluster:
+    def __init__(self, sgraph, fun, bb):
+        self.fun = fun
+        self.bb = bb
+
+    def to_dot(self, context):
+        result = 'subgraph "cluster_%s_bb_%i" {' % (self.fun, self.bb)
+        result += 'label="bb: %i"' % self.bb
+        result += ' style="dashed"; color="black"'
+        for snode in self.snodes:
+            result += context.node_to_dot(snode)
+        result += '}\n'
+        # TODO: Add an invisible edge from ENTRY to EXIT, to improve the graph layout.
+        return result
+
+    def add_node(self, snode):
+        self.snodes.append(snode)
+"""
+
+class SgraphFunCluster:
+    def __init__(self, sgraph, fun):
+        self.sgraph = sgraph
+        self.fun = fun
+        self.snodes = []
+
+    def to_dot(self, context):
+        result = 'subgraph "cluster_function_%s" {' % self.fun
+        result += 'label="%s"' % self.fun
+        result += ' style="dashed"; color="black"'
+        for snode in self.snodes:
+            result += context.node_to_dot(snode)
+        result += '}\n'
+        # TODO: Add an invisible edge from ENTRY to EXIT, to improve the graph layout.
+        return result
+
+    def add_node(self, snode):
+        self.snodes.append(snode)
+        """
+        print(snode)
+        bb = snode.bb_idx
+        if bb not in self.subcluster_map:
+            self.subcluster_map[bb] = SgraphBBCluster(self.sgraph, self.fun, bb)
+        self.subcluster_map[bb].add_node(snode)
+        """
+
+class SgraphRootCluster:
+    def __init__(self, sgraph):
+        self.subcluster_map = {}
+
+    def add_node(self, snode):
+        fun = snode.js['fun']
+        if fun not in self.subcluster_map:
+            self.subcluster_map[fun] = SgraphFunCluster(self, fun)
+        self.subcluster_map[fun].add_node(snode)
+
+    def to_dot(self, context):
+        result = ''
+        for subcluster in self.subcluster_map.values():
+            result += subcluster.to_dot(context)
+        return result
+
+def dump_dot(dot):
+    print('\n'.join('%i: %s' % (i + 1, line)
+                    for i, line in enumerate(dot.splitlines())))
+
+class SgraphWindow(Gtk.Window):
+    def __init__(self, dump):
+        Gtk.Window.__init__(self, title="supergraph")
+        self.dump = dump
+        self.dot_widget = MyDotWidget()
+        self.add(self.dot_widget)
+        context = SgraphContext()#self.dump.egraph)
+        context.root_cluster = SgraphRootCluster(dump.sgraph)
+        dot = dump.sgraph.to_dot(context)
+        if 0:
+            dump_dot(dot)
+        print('about to call set_dotcode')
+        self.dot_widget.set_dotcode(dot.encode())
+        print('done calling set_dotcode')
+        self.dot_widget.zoom_to_fit()
+        self.dot_widget.connect("clicked", self.on_widget_clicked)
+
+    def on_widget_clicked(self, widget):
+        print("Hello World")
+        print(repr(widget))
+
+class EgraphWindow(Gtk.Window):
+    def __init__(self, dump):
+        Gtk.Window.__init__(self, title="exploded graph")
+        self.dump = dump
+        self.dot_widget = MyDotWidget()
+        self.add(self.dot_widget)
+        context = EgraphContext(self.dump.egraph)
+        context.root_cluster = EgraphRootCluster(dump.sgraph)
+        context.sgraph = dump.sgraph
+        context.dm = dump.egraph.dm
+        dot = dump.egraph.to_dot(context)
+        if 0:
+            dump_dot(dot)
+        print('about to call set_dotcode')
+        self.dot_widget.set_dotcode(dot.encode())
+        print('done calling set_dotcode')
+        self.dot_widget.zoom_to_fit()
+        self.dot_widget.connect("clicked", self.on_widget_clicked)
+
+    def on_widget_clicked(self, widget):
+        print("Hello World")
+        print(repr(widget))
+
+def main():
+    parser = argparse.ArgumentParser(description='Viewer for -fdump-analyzer-json dump files.')
+    parser.add_argument('filename', metavar='FILENAME', type=str,
+                        help='the SRCFILE.analyzer.json.gz file to load')
+    args = parser.parse_args()
+
+    with gzip.open(args.filename) as f:
+        js = json.load(f)
+        d = AnalyzerDump.from_js (js)
+        egraph = js['egraph']
+        """
+        for enode in egraph['nodes']:
+            print(enode)
+            #print(ExplodedNode(enode))
+        for eedge in egraph['edges']:
+            print(eedge)
+        #init_enode = d.get_enode (enode_idxs[0])
+        #enodes = [d.get_enode (enode_idx) for enode_idx in enode_idxs]
+        """
+
+        win = EgraphWindow(d)
+        win.connect("destroy", Gtk.main_quit)
+        win.show_all()
+        win = SgraphWindow(d)
+        win.connect("destroy", Gtk.main_quit)
+        win.show_all()
+        Gtk.main()
+
+if __name__ == '__main__':
+    main()
